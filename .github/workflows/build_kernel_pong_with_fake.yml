@@ -554,7 +554,7 @@ jobs:
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: "${{ env.TAG_HEAD }}-${{ env.KSU_BRANCH }}-${{ env.TIME }}"
+          tag_name: "${{ env.TAG_HEAD }}-${{ env.TIME }}-fake"
           name: "${{ env.TAG_HEAD }}-${{ env.KSU_BRANCH }}-${{ env.TIME }}"
           body: |
             ### 📱 Nothing Phone 2 ${{ env.KSU_BRANCH }} Kernel | Build Information

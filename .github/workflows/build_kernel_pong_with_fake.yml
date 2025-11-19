@@ -1,0 +1,583 @@
+name: build_kernel_pong_with_fake
+
+env:
+  TZ: UTC
+  ANDROID_VERSION: 'android12'
+  KERNEL_VERSION: '5.10'
+  KERNEL_NAME: 'android12-9-00047-g4968e29b7f92-ab12786767'
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_type:
+        description: 'KernelSU branch (SukiSU Ultra/KernelSU Next/MKSU/KernelSU (Original), default SukiSU Ultra)'
+        required: true
+        type: choice
+        default: 'sukisu'
+        options:
+          - 'sukisu'
+          - 'ksunext'
+          - 'mksu'
+          - 'ksu'
+      kpm_enable:
+        description: 'Whether to enable KMP (only effective for SukiSU; may slightly increase power consumption, keep default off if not needed)'
+        required: true
+        type: choice
+        default: 'false'
+        options:
+          - 'true'
+          - 'false'
+      kernel_suffix:
+        description: 'Kernel suffix (leave empty for default, do not add hyphen at the beginning, avoid spaces and other reserved characters that affect command execution)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      ksuver: ${{ steps.ksu_version.outputs.ksuver }}
+
+    steps:
+      - name: Install environment dependencies + initialize source repository and llvm-Clang20 toolchain
+        run: |
+          rm -rf kernel_workspace
+          mkdir kernel_workspace
+          cd kernel_workspace
+          
+          sudo apt-mark hold firefox &&
+          sudo apt-mark hold libc-bin &&
+          sudo apt purge man-db &&
+          sudo rm -rf /var/lib/man-db/auto-update &&
+          sudo apt update &&
+          sudo apt-get install -y --no-install-recommends curl bison flex make binutils git perl gcc python3 python-is-python3 bc libssl-dev libelf-dev zip unzip ccache cpio &
+          
+          echo "Cloning Nothing Phone kernel source code..."
+          git clone --depth=1 -b dev \
+            https://github.com/TWO666/hellboy017_kernel_pong.git common &
+          
+          echo "Cloning llvm-Clang20 toolchain..." &&
+          mkdir -p clang20 &&
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip &&
+          unzip -q clang.zip -d clang20 &&
+          rm -rf clang.zip &
+          
+          echo "Cloning build tools..." &&
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -o build-tools.zip &&
+          unzip -q build-tools.zip &&
+          rm -rf build-tools.zip &
+          
+          wait
+          echo "Nothing Phone kernel source code and llvm-Clang20 toolchain initialization completed!"
+          echo "Removing ABI protection & removing dirty suffix..."
+          rm common/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+          done
+
+      - name: Configure ccache directory
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_nothing_5.10" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
+          echo "Current disk space:"
+          df -h
+          echo "Current kernel build version: Nothing Phone 5.10"
+
+      - name: Load ccache cache for current kernel version
+        uses: actions/cache@v4
+        id: ccache-restore
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-nothing-5.10-${{ runner.os }}-main
+          restore-keys: |
+            ccache-nothing-5.10-${{ runner.os }}-
+            ccache-nothing-5.10-
+      
+      - name: Initialize and configure ccache
+        run: |
+          # Set ccache environment variables
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${{ github.workspace }}"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_HARDLINK="true"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
+          
+          # Ensure ccache directory exists
+          mkdir -p "$CCACHE_DIR"
+          
+          # Reconfigure cache size on each run
+          echo "Configuring ccache cache size to: $CCACHE_MAXSIZE"
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -o compression=true
+          
+          # Show initial cache status
+          echo "ccache initial status:"
+          ccache -s
+          
+          # Show detailed information if cache restore hit
+          if [ "${{ steps.ccache-restore.outputs.cache-hit }}" == 'true' ]; then
+            echo "ccache cache hit details:"
+            ccache -sv
+          fi
+
+      - name: Add KernelSU
+        id: ksu_version
+        run: |
+          cd kernel_workspace
+          
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "Configuring SukiSU Ultra..."
+            curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s susfs-main
+            cd ./KernelSU
+            # Get current Git commit short hash (8 characters)
+            GIT_COMMIT_HASH=$(git rev-parse --short=8 HEAD)
+            echo "Current commit hash: $GIT_COMMIT_HASH"
+            export KSU_VERSION=$KSU_VERSION
+            # Try up to 3 times to get KernelSU API version
+            for i in {1..3}; do
+              # Extract KSU_API_VERSION from remote Makefile
+              KSU_API_VERSION=$(curl -s "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/susfs-main/kernel/Makefile" | 
+                # Find first line containing version definition
+                grep -m1 "KSU_VERSION_API :=" | 
+                # Extract value after equals sign
+                awk -F'= ' '{print $2}' | 
+                # Remove all whitespace characters
+                tr -d '[:space:]')
+              # Break loop if version obtained successfully, otherwise wait 1 second and retry
+              [ -n "$KSU_API_VERSION" ] && break || sleep 1
+            done
+            # Use default version 3.1.7 if failed to get version
+            [ -z "$KSU_API_VERSION" ] && KSU_API_VERSION="3.1.7"
+            # Store API version to GitHub environment variable
+            echo "KSU_API_VERSION=$KSU_API_VERSION" >> $GITHUB_ENV
+            # Create version definition template & version format function: use obtained commit hash and fixed suffix
+            # KSU_VERSION_API: API version definition
+            # KSU_VERSION_FULL: Complete version definition
+            VERSION_DEFINITIONS=$'define get_ksu_version_full\nv\\$1-'"$GIT_COMMIT_HASH"$'@nothing\nendef\n\nKSU_VERSION_API := '"$KSU_API_VERSION"$'\nKSU_VERSION_FULL := v'"$KSU_API_VERSION"$'-'"$GIT_COMMIT_HASH"$'@nothing'
+            # Clean old version definitions in kernel Makefile
+            # Remove version function
+            sed -i '/define get_ksu_version_full/,/endef/d' kernel/Makefile
+            # Remove API version definition
+            sed -i '/KSU_VERSION_API :=/d' kernel/Makefile
+            # Remove complete version definition
+            sed -i '/KSU_VERSION_FULL :=/d' kernel/Makefile
+            # Insert new version definition after REPO_OWNER line
+            awk -v def="$VERSION_DEFINITIONS" '
+              # When REPO_OWNER line found, insert version definition and set flag
+              /REPO_OWNER :=/ {print; print def; inserted=1; next}
+              # Print all lines
+              1
+              # Append at end of file if insertion point not found
+              END {if (!inserted) print def}
+            ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
+
+            # Generate custom version number (based on commit count), use 114514 if failed
+            KSU_VERSION=$(expr $(git rev-list --count main) + 37185 2>/dev/null || echo 114514)
+            # Store version number to GitHub environment variable
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+
+            # Verify modification results
+            grep -A10 "REPO_OWNER" kernel/Makefile  # Check content after insertion point
+            grep "KSU_VERSION_FULL" kernel/Makefile # Confirm version definition exists
+            echo "SukiSU version: v${KSU_API_VERSION}-${GIT_COMMIT_HASH}@nothing"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            echo "Configuring KernelSU Next..."
+            curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+            cd KernelSU-Next
+            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/pershoot/KernelSU-Next/commits?sha=next&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 10200)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+            echo "KernelSU Next version: $KSU_VERSION"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "mksu" ]]; then
+            echo "Configuring MKSU (5ec1cff/KernelSU)..."
+            curl -LSs "https://raw.githubusercontent.com/5ec1cff/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/5ec1cff/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 20000)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+            echo "MKSU version: $KSU_VERSION"
+          else
+            echo "Configuring official KernelSU (tiann/KernelSU)..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 20000)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+            echo "Official KernelSU version: $KSU_VERSION"
+          fi
+
+      - name: Apply KernelSU & SUSFS patches
+        run: |
+          cd kernel_workspace
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "Adding SukiSU Ultra patches..."
+            git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            git clone https://github.com/ShirkNeko/SukiSU_patch.git
+            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            cp ./SukiSU_patch/69_hide_stuff.patch ./common/
+            cd ./common
+            patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            # Temporary fix for task_mmu.c unable to find show_pad method after patching in some kernel versions
+            sed -i 's/goto show_pad;/return 0;/g' ./fs/proc/task_mmu.c
+            patch -p1 < 69_hide_stuff.patch || true
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            echo "Adding KernelSU Next patches..."
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            # Since KernelSU Next has not been updated to adapt susfs 2.0.0, rollback to susfs 1.5.12
+            cd susfs4ksu && git checkout 8a76ba240d1f7315352b49d97d854a4b166e5b47 && cd ..
+            git clone https://github.com/WildKernels/kernel_patches.git
+            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            cp ./kernel_patches/next/scope_min_manual_hooks_v1.5.patch ./common/
+            cp ./kernel_patches/69_hide_stuff.patch ./common/
+            cd ./common
+            patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            # Temporary fix for task_mmu.c unable to find show_pad method after patching in some kernel versions
+            sed -i 's/goto show_pad;/return 0;/g' ./fs/proc/task_mmu.c
+            patch -p1 -N -F 3 < scope_min_manual_hooks_v1.5.patch || true
+            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+            # Add WildKSU manager support for KernelSU Next
+            cd ./drivers/kernelsu
+            wget https://github.com/WildKernels/kernel_patches/raw/refs/heads/main/next/susfs_fix_patches/v1.5.12/fix_apk_sign.c.patch
+            patch -p2 -N -F 3 < fix_apk_sign.c.patch || true
+          elif [[ ${{ github.event.inputs.ksu_type }} == "mksu" ]]; then
+            echo "Adding patches for MKSU (5ec1cff/KernelSU)..."
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            git clone https://github.com/ShirkNeko/SukiSU_patch.git
+            cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
+            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            cp ./SukiSU_patch/69_hide_stuff.patch ./common/
+            cd ./KernelSU
+            patch -p1 < 10_enable_susfs_for_ksu.patch || true
+            # Fix susfs 2.0.0 patches for MKSU
+            wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/other_patch/mksu_supercalls.patch
+            patch -p1 < mksu_supercalls.patch || true
+            wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/other_patch/fix_umount.patch
+            patch -p1 < fix_umount.patch || true
+            cd ../common
+            patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+          else
+            echo "Adding patches for official KernelSU (tiann/KernelSU)..."
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            git clone https://github.com/ShirkNeko/SukiSU_patch.git
+            cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
+            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            cp ./SukiSU_patch/69_hide_stuff.patch ./common/
+            cd ./KernelSU
+            patch -p1 < 10_enable_susfs_for_ksu.patch || true
+            wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/other_patch/fix_umount.patch
+            patch -p1 < fix_umount.patch || true
+            cd ../common
+            patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+          fi
+          
+
+      - name: Add KSU & SUSFS configuration items
+        run: |
+          cd kernel_workspace
+          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          if [[ ${{ github.event.inputs.kpm_enable }} == 'true' && ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          fi
+          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          # Add support for Mountify (backslashxx/mountify) module
+          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          # Build optimization configuration
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_LTO_CLANG_THIN=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_LTO_CLANG=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          echo "CONFIG_OPTIMIZE_INLINING=y" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+          # Disable defconfig check
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+          # Skip unnecessary operation of installing uapi standard headers to usr/include directory, save compilation time
+          echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/vendor/meteoric_defconfig
+
+      - name: Add build identifier
+        run: |
+          cd kernel_workspace
+          echo "Replacing kernel version suffix..."
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            echo "Current kernel version suffix: ${{ github.event.inputs.kernel_suffix }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ github.event.inputs.kernel_suffix }}\"|" "$f"
+            done
+          else
+            echo "Current kernel version suffix: ${{ env.KERNEL_NAME }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" "$f"
+            done
+          fi
+
+      - name: Build kernel
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          CLANG_DIR="$WORKDIR/kernel_workspace/clang20/bin"
+          CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
+          LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
+          echo "Compiler information:"
+          echo "Clang version: $CLANG_VERSION"
+          echo "LLD version: $LLD_VERSION"
+          pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole version: not installed" || echo "pahole version: $pahole_version"
+          
+          export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${{ github.workspace }}"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_HARDLINK="true"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_MAXSIZE="3G"
+          echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "$CCACHE_DIR/ccache.conf"
+          
+          cd kernel_workspace/common
+          
+          # Set target build timestamp
+          BUILD_TIMESTAMP="2024-12-11 21:50:47"
+          export SOURCE_DATE_EPOCH=$(date -d "$BUILD_TIMESTAMP" +%s)
+          export KBUILD_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
+          
+          # Install faketime tool
+          sudo apt-get update && sudo apt-get install -y faketime
+          
+          # Directly modify kernel timestamp-related source files
+          echo "Modifying timestamps in kernel source..."
+          
+          # 1. Modify scripts/mkcompile_h script
+          if [ -f scripts/mkcompile_h ]; then
+            cp scripts/mkcompile_h scripts/mkcompile_h.bak
+            # Replace all date commands with fixed time
+            sed -i 's/`date`/echo "Wed Dec 11 21:50:47 UTC 2024"/' scripts/mkcompile_h
+            sed -i 's/`LC_ALL=C date`/echo "Wed Dec 11 21:50:47 UTC 2024"/' scripts/mkcompile_h
+            sed -i 's/$(date)/echo "Wed Dec 11 21:50:47 UTC 2024"/' scripts/mkcompile_h
+            sed -i 's/\$DATE/echo "Wed Dec 11 21:50:47 UTC 2024"/' scripts/mkcompile_h
+          fi
+          
+          # 2. Create fixed compilation time header file
+          mkdir -p include/generated
+          cat > include/generated/compile.h << 'EOF'
+          /* This file is auto generated, version 1 */
+          /* SMP PREEMPT */
+          #define UTS_MACHINE "aarch64"
+          #define UTS_VERSION "#1 Wed Dec 11 21:50:47 UTC 2024"
+          #define LINUX_COMPILE_BY "root"
+          #define LINUX_COMPILE_HOST "localhost"  
+          #define LINUX_COMPILE_DOMAIN "(none)"
+          #define LINUX_COMPILE_TIME "21:50:47"
+          #define LINUX_COMPILE_DATE "Dec 11 2024"
+          #define LINUX_COMPILER "clang version 20.0.0git"
+          EOF
+          
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_TIMESTAMP=$BUILD_TIMESTAMP" >> $GITHUB_ENV
+          # Verify timestamp settings
+          echo "--- Deterministic build timestamp setup completed ---"
+          echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+          echo "KBUILD_BUILD_TIMESTAMP: $KBUILD_BUILD_TIMESTAMP" 
+          echo "Target timestamp: Wed Dec 11 21:50:47 UTC 2024"
+          echo "Current system time: $(date)"
+          echo "faketime test: $(faketime '2024-12-11 21:50:47' date)"
+          
+          # Clean unnecessary .NET, Android NDK, Haskell, CodeQL runtimes while building kernel, free space without blocking subsequent steps
+          sudo rm -rf /usr/share/dotnet &
+          sudo rm -rf /usr/local/lib/android &
+          sudo rm -rf /opt/ghc &
+          sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          # Use deterministic build timestamp for compilation
+          echo "--- Starting deterministic build ---"
+          
+          # Step 1: Generate configuration (no timestamp needed)
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error vendor/meteoric_defconfig
+          
+          # Step 2: Use faketime for actual compilation to ensure timestamp consistency
+          echo "Compiling with faketime..."
+          faketime '2024-12-11 21:50:47' \
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+            KBUILD_BUILD_TIMESTAMP="Wed Dec 11 21:50:47 UTC 2024" \
+            Image
+          
+          # Verify timestamps in compilation results
+          echo "--- Compilation completed, verifying timestamps ---"
+          if [ -f out/include/generated/compile.h ]; then
+            echo "Build timestamp verification:"
+            grep -E "UTS_VERSION|LINUX_COMPILE_(TIME|DATE)" out/include/generated/compile.h || echo "Timestamp definitions not found in compile.h"
+          fi
+          echo "Kernel compilation completed!"
+          echo "ccache status:"
+          ccache -s
+          echo "Space after compilation:"
+          df -h
+
+      - name: Apply KPM and patch kernel
+        run: |
+          if [[ ${{ github.event.inputs.kpm_enable }} == 'true' && ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "Applying KPM and patching kernel..."
+            cd kernel_workspace/common/out/arch/arm64/boot
+            curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/patch_linux
+            chmod +x patch_linux
+            ./patch_linux
+            rm -f Image
+            mv oImage Image
+          fi
+          
+      - name: Clone AnyKernel3 and package
+        run: |
+          cd kernel_workspace
+          git clone https://github.com/TWO666/AnyKernel3.git -b gki-2.0 --depth=1
+          rm -rf ./AnyKernel3/.git
+          cd AnyKernel3
+          cp ../common/out/arch/arm64/boot/Image ./Image
+          if [[ ! -f ./Image ]]; then
+            echo "Kernel image file not found, build may have failed"
+            exit 1
+          fi
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            KSU_TYPENAME="SukiSU"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            KSU_TYPENAME="KSUNext"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "mksu" ]]; then
+            KSU_TYPENAME="MKSU"
+          else
+            KSU_TYPENAME="KSU"
+          fi
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            zip -r ../AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_NothingPhone2_${{ github.event.inputs.kernel_suffix }}.zip ./*
+          else
+            zip -r ../AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_NothingPhone2_${{ env.KERNEL_NAME }}.zip ./*
+          fi
+
+      - name: Upload ZIP artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel_ZIP_Artifacts
+          path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
+
+      - name: Generate build summary
+        run: |
+          echo "# Nothing Phone 2 Kernel Build Completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Device**: Nothing Phone 2" >> $GITHUB_STEP_SUMMARY
+          echo "- **Android Version**: 12" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kernel Version**: 5.10" >> $GITHUB_STEP_SUMMARY
+          echo "- **KernelSU Type**: ${{ github.event.inputs.ksu_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **KSU Version**: ${{ env.KSUVER }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **KPM Support**: ${{ github.event.inputs.kpm_enable }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SUSFS Version**: v1.5.12" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          ls -la kernel_workspace/AnyKernel*.zip | awk '{print "- **" $9 "**"}' >> $GITHUB_STEP_SUMMARY
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+      
+    steps:
+      - name: Download ZIP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Kernel_ZIP_Artifacts
+          path: ./release_zips
+
+      - name: Set environment variables
+        run: |
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            FULL_VERSION=${{ format('{0}-{1}', env.KERNEL_VERSION, github.event.inputs.kernel_suffix) }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          else
+            FULL_VERSION=${{ format('{0}-{1}', env.KERNEL_VERSION, env.KERNEL_NAME) }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          fi
+          TIME="$(TZ='UTC' date +'%y%m%d%H%M%S')"
+          TIME_FORM="$(TZ='UTC' date +'%Y-%m-%d %H:%M:%S')"
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+          TAG_HEAD="pong_kernel_fake"
+          echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
+
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            KSU_BRANCH="SukiSU Ultra"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            KSU_BRANCH="KernelSU Next"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "mksu" ]]; then
+            KSU_BRANCH="MKSU"
+          else
+            KSU_BRANCH="KernelSU (Official)"
+          fi
+          echo "KSU_BRANCH=$KSU_BRANCH" >> $GITHUB_ENV
+         
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "${{ env.TAG_HEAD }}-${{ env.KSU_BRANCH }}-${{ env.TIME }}"
+          name: "${{ env.TAG_HEAD }}-${{ env.KSU_BRANCH }}-${{ env.TIME }}"
+          body: |
+            ### 📱 Nothing Phone 2 ${{ env.KSU_BRANCH }} Kernel | Build Information
+            - Kernel Version: ${{ env.FULL_VERSION }}
+            - Real Kernel Version: 5.10.237
+            - Real Build Time: ${{ env.TIME_FORM }}
+            - Device: Nothing Phone 2 (android12-5.10)
+            - Features: ${{ env.KSU_BRANCH }} + SUSFS
+            - KPM Support (only for SukiSU): ${{ github.event.inputs.kpm_enable }}
+            - TESTED ON: Nothing Phone 2 Nothing OS 3.2 stock ROM
+            - SukiSU Ultra Manager Download: [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+            - KernelSU Next Manager Download: [KernelSU-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)
+            - Wild KSU Manager Download (compatible with KernelSU Next): [Wild-KSU](https://github.com/WildKernels/Wild_KSU/releases)
+            - MKSU Manager Download: [Magic-KernelSU](https://github.com/5ec1cff/KernelSU/actions)
+            - KSU Official Manager Download: [KernelSU](https://github.com/tiann/KernelSU/releases)
+            ### ⏫️ Update Content:
+            - Updated ${{ env.KSU_BRANCH }} to latest version ${{ needs.build.outputs.ksuver }}
+            ### 📋 Installation Guide
+            1. If your phone has already installed third-party Recovery (such as TWRP, OrangeFox), you can download the corresponding AnyKernel flash package, enter Recovery mode, flash the package through Recovery and restart the device
+            2. If your phone already has root privileges, you can install [HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases) on your phone, flash the AnyKernel package in HorizonKernelFlasher and restart
+            3. If you have previously flashed the corresponding KSU kernel and the KSU manager has been updated to the latest version, you can directly flash the AnyKernel package in the KSU manager and restart
+            #### ※※※Flashing kernels carries risks. To prevent accidents that may cause device to brick, please backup boot and other critical boot partitions using [KernelFlasher](https://github.com/capntrips/KernelFlasher) or similar tools before flashing the kernel!※※※
+          draft: false
+          prerelease: true
+          files: |
+            release_zips/AnyKernel3_*.zip

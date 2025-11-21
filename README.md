@@ -10,7 +10,7 @@
 An automated kernel builder for Nothing Phone 2 (Pong) that supports multiple KernelSU variants including SukiSU Ultra, KernelSU Next, MKSU, and official KernelSU. This project provides both GitHub Actions workflows for cloud building and local build scripts for manual compilation.
 
 
-**Kernel**: [helloboy017_kernel_pong](https://github.com/TWO666/helloboy017_kernel_pong) (A CLO based kernel from [HELLBOY017](https://github.com/HELLBOY017/kernel_nothing_sm8475))
+**Kernel**: [hellboy017_kernel_pong](https://github.com/TWO666/hellboy017_kernel_pong) (A CLO based kernel from [HELLBOY017](https://github.com/HELLBOY017/kernel_nothing_sm8475))
 
 ## ✨ Features
 

@@ -536,7 +536,7 @@ jobs:
           TIME_FORM="$(TZ='UTC' date +'%Y-%m-%d %H:%M:%S')"
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
-          TAG_HEAD="pong_kernel_fake"
+          TAG_HEAD="pong_kernel"
           echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
 
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
@@ -554,8 +554,8 @@ jobs:
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: "${{ env.TAG_HEAD }}-${{ env.TIME }}-fake"
-          name: "${{ env.TAG_HEAD }}-${{ env.KSU_BRANCH }}-${{ env.TIME }}"
+          tag_name: "${{ env.TAG_HEAD }}-${{ env.TIME }}"
+          name: "${{ env.TAG_HEAD }}-${{ env.KSU_BRANCH }}-${{ env.TIME }}-fake"
           body: |
             ### 📱 Nothing Phone 2 ${{ env.KSU_BRANCH }} Kernel | Build Information
             - Kernel Version: ${{ env.FULL_VERSION }}
